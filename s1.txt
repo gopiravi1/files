@@ -1,0 +1,916 @@
+#!/usr/bin/env python3
+"""
+Element-level FEA comparator and segregator (robust, multiprocessing-safe)
+
+- Parses LS-DYNA (.k/.dyn/.key), Nastran (.bdf/.nas/.dat), Abaqus (.inp), STL (.stl)
+- Extracts nodes, elements, parts, property cards, material cards, element->property mapping
+- Infers per-element thickness and computes per-part element-thickness statistics
+- Compares baseline vs target for geometry, properties, materials, nodes, element thickness
+- Segregates changed parts and writes supporting detail files
+- Multiprocessing-safe (no local lambdas in returned structures)
+"""
+
+import os
+import sys
+import re
+import glob
+import json
+import math
+import difflib
+import statistics
+from decimal import Decimal, getcontext
+from collections import defaultdict
+from multiprocessing import Pool, cpu_count
+import datetime
+
+getcontext().prec = 28
+
+# -------------------------
+# Module-level factories (picklable)
+# -------------------------
+def part_factory():
+    return {
+        'name': None,
+        'mid': None,
+        'thickness': None,
+        'prop_raw': None,
+        'mat_raw': None,
+        'elem_ids': set(),
+        'node_ids': set(),
+        'is_shell': False,
+        'elements': {}
+    }
+
+def simple_factory():
+    return {}
+
+# -------------------------
+# Config loader
+# -------------------------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+            cfg = json.load(f)
+    except Exception as e:
+        print(f"Error loading config.json: {e}")
+        sys.exit(1)
+
+    IO = cfg.get("IO", {})
+    TOL = cfg.get("TOLERANCES", {})
+    COMP = cfg.get("COMPARISON", {})
+
+    input_dir = IO.get("INPUT_DIR", "./input_models")
+    output_dir = IO.get("OUTPUT_DIR", "./output_results")
+    fea_exts = [e.strip().lower() for e in IO.get("FEA_EXTENSIONS", []) if e.strip()]
+    geom_exts = [e.strip().lower() for e in IO.get("GEOMETRY_EXTENSIONS", []) if e.strip()]
+
+    fea_patterns = [f"*{e}" for e in fea_exts]
+    geom_patterns = [f"*{e}" for e in geom_exts]
+    all_patterns = fea_patterns + geom_patterns
+
+    thickness_tol = Decimal(str(TOL.get("THICKNESS_TOLERANCE", 1e-6)))
+    volume_tol = Decimal(str(TOL.get("VOLUME_CHANGE_TOLERANCE", 0.0001)))
+    node_tol = float(TOL.get("NODE_COORD_TOLERANCE", 1e-6))
+    elem_thickness_rel_tol = Decimal(str(TOL.get("ELEMENT_THICKNESS_REL_TOL", 0.01)))
+    elem_thickness_abs_tol = Decimal(str(TOL.get("ELEMENT_THICKNESS_ABS_TOL", 1e-6)))
+
+    baseline_name = COMP.get("BASELINE_FILE_NAME", "Design_1.dyn")
+    target_patterns = COMP.get("TARGET_FILE_NAME", [])
+
+    return {
+        "INPUT_DIR": input_dir,
+        "OUTPUT_DIR": output_dir,
+        "FEA_PATTERNS": fea_patterns,
+        "GEOM_PATTERNS": geom_patterns,
+        "ALL_PATTERNS": all_patterns,
+        "THICKNESS_TOL": thickness_tol,
+        "VOLUME_TOL": volume_tol,
+        "NODE_TOL": node_tol,
+        "ELEM_THICK_REL_TOL": elem_thickness_rel_tol,
+        "ELEM_THICK_ABS_TOL": elem_thickness_abs_tol,
+        "BASELINE_FILE_NAME": baseline_name,
+        "TARGET_FILE_PATTERNS": target_patterns
+    }
+
+# -------------------------
+# Utilities
+# -------------------------
+def _get_files(patterns, input_dir):
+    files = []
+    for p in patterns:
+        files.extend(glob.glob(os.path.join(input_dir, p)))
+    return sorted(files)
+
+def numeric_tokens_from_text(text):
+    if not text:
+        return []
+    return re.findall(r'[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[Ee][+-]?\d+)?', text)
+
+def normalize_block(lines):
+    if not lines:
+        return ''
+    if isinstance(lines, list):
+        lines = '\n'.join(lines)
+    return '\n'.join([re.sub(r'\s+', ' ', ln.strip()) for ln in lines.splitlines() if ln.strip()])
+
+def calculate_centroid(coords):
+    if not coords:
+        return (0.0, 0.0, 0.0)
+    xs = [c[0] for c in coords]; ys = [c[1] for c in coords]; zs = [c[2] for c in coords]
+    return (sum(xs)/len(xs), sum(ys)/len(ys), sum(zs)/len(zs))
+
+def calculate_bounding_box_volume(coords):
+    if not coords:
+        return Decimal('0.0')
+    xs = [c[0] for c in coords]; ys = [c[1] for c in coords]; zs = [c[2] for c in coords]
+    dx = Decimal(str(max(xs) - min(xs))); dy = Decimal(str(max(ys) - min(ys))); dz = Decimal(str(max(zs) - min(zs)))
+    return dx * dy * dz
+
+# -------------------------
+# Robust parsers (no local lambdas)
+# -------------------------
+def parse_dyna(filepath):
+    nodes = {}
+    elements = {}
+    parts = defaultdict(part_factory)
+    materials = {}
+    sections = {}
+    elem_to_pid = {}
+
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+
+    current = None
+    i = 0
+    while i < len(lines):
+        raw = lines[i].rstrip('\n')
+        line = raw.strip()
+        if not line or line.startswith('$'):
+            i += 1; continue
+        if line.startswith('*'):
+            current = line.split()[0].upper()
+            if current.startswith('*MAT'):
+                block = [line]
+                j = i + 1
+                while j < len(lines) and not lines[j].strip().startswith('*'):
+                    if lines[j].strip():
+                        block.append(lines[j].rstrip('\n'))
+                    j += 1
+                nums = numeric_tokens_from_text('\n'.join(block))
+                mid = None
+                if nums:
+                    try:
+                        mid = int(float(nums[0]))
+                    except:
+                        mid = None
+                if mid is not None:
+                    materials[mid] = {'raw': block, 'tokens': nums}
+                i = j; continue
+            if current == '*SECTION_SHELL':
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines):
+                    sec_line = lines[j].strip()
+                    parts_line = re.split(r'[,\s]+', sec_line)
+                    ints = [p for p in parts_line if re.match(r'^\d+$', p)]
+                    nums = numeric_tokens_from_text(sec_line)
+                    if ints and nums:
+                        try:
+                            secid = int(ints[0])
+                            thickness = Decimal(str(float(nums[-1])))
+                            sections[secid] = {'raw': [sec_line], 'thickness': thickness}
+                        except:
+                            sections[f'line_{j}'] = {'raw': [sec_line]}
+                    else:
+                        sections[f'line_{j}'] = {'raw': [sec_line]}
+                i = j + 1; continue
+            i += 1; continue
+
+        if current == '*NODE':
+            tokens = re.split(r'[,\s]+', line)
+            try:
+                nid = int(tokens[0]); x = float(tokens[1]); y = float(tokens[2]); z = float(tokens[3])
+                nodes[nid] = (x, y, z)
+            except:
+                pass
+
+        elif current in ('*ELEMENT_SHELL', '*ELEMENT'):
+            tokens = re.split(r'[,\s]+', line)
+            try:
+                eid = int(tokens[0]); pid = int(tokens[1])
+                node_ids = []
+                for t in tokens[2:]:
+                    try:
+                        nid = int(t); node_ids.append(nid)
+                    except:
+                        continue
+                elements[eid] = {'pid': pid, 'nodes': node_ids}
+                elem_to_pid[eid] = pid
+                parts[pid]['elem_ids'].add(eid)
+                for nid in node_ids:
+                    parts[pid]['node_ids'].add(nid)
+            except:
+                pass
+
+        elif current == '*PART':
+            part_name = line
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines):
+                data_line = lines[j]
+                try:
+                    pid = int(data_line[0:10].strip() or data_line.split()[0])
+                    mid = int(data_line[10:20].strip() or data_line.split()[1])
+                    secid = None
+                    try:
+                        secid = int(data_line[20:30].strip() or data_line.split()[2])
+                    except:
+                        tokens = re.split(r'[,\s]+', data_line)
+                        if len(tokens) > 2 and re.match(r'^\d+$', tokens[2]):
+                            secid = int(tokens[2])
+                    parts[pid]['name'] = part_name
+                    parts[pid]['mid'] = mid
+                    if secid and secid in sections and 'thickness' in sections[secid]:
+                        parts[pid]['thickness'] = sections[secid]['thickness']
+                except:
+                    pass
+                i = j
+        i += 1
+
+    for pid, pdata in parts.items():
+        mid = pdata.get('mid')
+        if mid and mid in materials:
+            pdata['mat_raw'] = materials[mid]['raw']
+
+    return {'nodes': nodes, 'elements': elements, 'parts': parts, 'materials': materials, 'sections': sections, 'elem_to_pid': elem_to_pid}
+
+def parse_nastran(filepath):
+    nodes = {}
+    elements = {}
+    parts = defaultdict(part_factory)
+    properties = {}
+    materials = {}
+    elem_to_pid = {}
+
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+    content = re.sub(r'\$[^\n]*', '', content)
+    lines = content.splitlines()
+    for line in lines:
+        fields = re.split(r'[,\s]+', line.strip())
+        if not fields:
+            continue
+        kw = fields[0].upper()
+        try:
+            if kw == 'GRID' and len(fields) >= 6:
+                nid = int(fields[1]); x = float(fields[3]); y = float(fields[4]); z = float(fields[5])
+                nodes[nid] = (x, y, z)
+            elif kw == 'PSHELL' and len(fields) >= 4:
+                pid = int(fields[1]); mid = int(fields[2]); t = float(fields[3])
+                properties[pid] = {'raw': line.strip(), 'thickness': Decimal(str(t)), 'mid': mid}
+            elif kw == 'MAT1' and len(fields) >= 3:
+                mid = int(fields[1])
+                materials[mid] = {'raw': line.strip(), 'tokens': numeric_tokens_from_text(line)}
+            elif kw in ('CQUAD4', 'CTRIA3') and len(fields) >= 5:
+                eid = int(fields[1]); pid = int(fields[2])
+                node_ids = []
+                for t in fields[3:]:
+                    try:
+                        nid = int(t); node_ids.append(nid)
+                    except:
+                        continue
+                elements[eid] = {'pid': pid, 'nodes': node_ids}
+                elem_to_pid[eid] = pid
+                parts[pid]['elem_ids'].add(eid)
+                for nid in node_ids:
+                    parts[pid]['node_ids'].add(nid)
+                if pid in properties:
+                    parts[pid].update(properties[pid])
+                    parts[pid]['is_shell'] = True
+                    parts[pid]['name'] = f"PID_{pid}"
+        except:
+            continue
+    for pid, pdata in parts.items():
+        mid = pdata.get('mid')
+        if mid and mid in materials:
+            pdata['mat_raw'] = materials[mid]['raw']
+    return {'nodes': nodes, 'elements': elements, 'parts': parts, 'properties': properties, 'materials': materials, 'elem_to_pid': elem_to_pid}
+
+def parse_abaqus(filepath):
+    nodes = {}
+    elements = {}
+    parts = defaultdict(part_factory)
+    materials = {}
+    pid_props = {}
+    elem_to_pid = {}
+
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if not line or line.startswith('**'):
+            continue
+        up = line.upper()
+        if up.startswith('*NODE'):
+            for j in range(i+1, len(lines)):
+                l = lines[j].strip()
+                if not l or l.startswith('*'):
+                    break
+                try:
+                    parts_line = [p.strip() for p in l.split(',')]
+                    nid = int(parts_line[0]); x = float(parts_line[1]); y = float(parts_line[2]); z = float(parts_line[3])
+                    nodes[nid] = (x, y, z)
+                except:
+                    continue
+        if up.startswith('*ELEMENT'):
+            if 'ELSET=' in up:
+                set_name = up.split('ELSET=')[1].split(',')[0].strip()
+                pid = hash(set_name)
+                for j in range(i+1, len(lines)):
+                    l = lines[j].strip()
+                    if not l or l.startswith('*'):
+                        break
+                    try:
+                        fields = [p.strip() for p in l.split(',')]
+                        eid = int(fields[0])
+                        node_ids = [int(x) for x in fields[1:] if x.strip()]
+                        elements[eid] = {'pid': pid, 'nodes': node_ids}
+                        elem_to_pid[eid] = pid
+                        parts[pid]['elem_ids'].add(eid)
+                        for nid in node_ids:
+                            parts[pid]['node_ids'].add(nid)
+                    except:
+                        continue
+        if up.startswith('*SHELL SECTION'):
+            if 'ELSET=' in up:
+                set_name = up.split('ELSET=')[1].split(',')[0].strip()
+                pid = hash(set_name)
+                mid = None
+                if 'MATERIAL=' in up:
+                    mid = up.split('MATERIAL=')[1].split(',')[0].strip()
+                thickness = None
+                for j in range(i+1, len(lines)):
+                    t_line = lines[j].strip()
+                    if not t_line or t_line.startswith('*'):
+                        continue
+                    try:
+                        thickness = Decimal(t_line.split(',')[0].strip())
+                        pid_props[pid] = {'raw': [line, t_line], 'thickness': thickness, 'mid': mid}
+                        break
+                    except:
+                        continue
+        if up.startswith('*MATERIAL'):
+            name = None
+            if 'NAME=' in up:
+                name = up.split('NAME=')[1].split(',')[0].strip()
+            mat_lines = []
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith('*'):
+                if lines[j].strip():
+                    mat_lines.append(lines[j].rstrip('\n'))
+                j += 1
+            key = name or f"mat_at_{i}"
+            materials[key] = {'raw': mat_lines, 'tokens': numeric_tokens_from_text('\n'.join(mat_lines))}
+    for pid, props in pid_props.items():
+        if pid in parts:
+            parts[pid].update(props)
+            parts[pid]['is_shell'] = True
+            mid = props.get('mid')
+            if mid and mid in materials:
+                parts[pid]['mat_raw'] = materials[mid]['raw']
+    for pid, pdata in parts.items():
+        if pdata.get('mat_raw') is None:
+            mid = pdata.get('mid')
+            if mid and mid in materials:
+                pdata['mat_raw'] = materials[mid]['raw']
+    return {'nodes': nodes, 'elements': elements, 'parts': parts, 'materials': materials, 'pid_props': pid_props, 'elem_to_pid': elem_to_pid}
+
+def parse_stl(filepath):
+    coords = []
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            parts_line = line.strip().lower().split()
+            if parts_line and parts_line[0] == 'vertex' and len(parts_line) == 4:
+                try:
+                    coords.append((float(parts_line[1]), float(parts_line[2]), float(parts_line[3])))
+                except:
+                    continue
+    pid = hash(os.path.basename(filepath))
+    parts = defaultdict(part_factory)
+    parts[pid]['node_ids'] = set(range(1, len(coords)+1))
+    nodes = {i+1: coords[i] for i in range(len(coords))}
+    return {'nodes': nodes, 'elements': {}, 'parts': parts, 'materials': {}, 'sections': {}, 'elem_to_pid': {}}
+
+# -------------------------
+# Worker wrapper (top-level)
+# -------------------------
+def parse_file_worker(args):
+    filepath, fea_patterns, geom_patterns = args
+    ext = os.path.splitext(filepath)[1].lower()
+    try:
+        if ext in ('.k', '.key', '.dyn'):
+            parsed = parse_dyna(filepath)
+        elif ext in ('.bdf', '.nas', '.dat'):
+            parsed = parse_nastran(filepath)
+        elif ext == '.inp':
+            parsed = parse_abaqus(filepath)
+        elif ext == '.stl':
+            parsed = parse_stl(filepath)
+        else:
+            return None
+    except Exception as e:
+        print(f"Error parsing {filepath}: {e}")
+        return None
+
+    nodes_map = parsed.get('nodes', {})
+    parts_raw = parsed.get('parts', {})
+    elements = parsed.get('elements', {})
+    elem_to_pid = parsed.get('elem_to_pid', {})
+
+    part_metrics = {}
+    for pid, pdata in parts_raw.items():
+        node_ids = sorted(list(pdata.get('node_ids', set())))
+        coords = [nodes_map[nid] for nid in node_ids if nid in nodes_map]
+        if not coords:
+            coords2 = []
+            for eid in pdata.get('elem_ids', set()):
+                elem = elements.get(eid)
+                if elem:
+                    for nid in elem.get('nodes', []):
+                        if nid in nodes_map:
+                            coords2.append(nodes_map[nid])
+            coords = coords2
+        if not coords:
+            continue
+        centroid = calculate_centroid(coords)
+        volume = calculate_bounding_box_volume(coords)
+        part_metrics[pid] = {
+            'name': pdata.get('name'),
+            'mid': pdata.get('mid'),
+            'thickness': pdata.get('thickness'),
+            'prop_raw': pdata.get('prop_raw') or pdata.get('raw'),
+            'mat_raw': pdata.get('mat_raw'),
+            'elem_ids': set(pdata.get('elem_ids', set())),
+            'node_ids': node_ids,
+            'nodes_coords': coords,
+            'centroid': centroid,
+            'volume': volume,
+            'elements': {eid: elements[eid] for eid in pdata.get('elem_ids', set()) if eid in elements},
+            'filepath': filepath,
+            'parsed_full': parsed
+        }
+    return part_metrics, filepath
+
+# -------------------------
+# Matching
+# -------------------------
+def match_parts_by_geometry(baseline_metrics, target_metrics, centroid_tol, overlap_threshold=0.8):
+    matches = []
+    baseline_only = set(baseline_metrics.keys())
+    target_only = set(target_metrics.keys())
+    tol = float(centroid_tol)
+    for b_pid, b in baseline_metrics.items():
+        b_centroid = b.get('centroid', (0.0,0.0,0.0))
+        b_nodes = b.get('nodes_coords', [])
+        best = None; best_score = -1.0
+        for t_pid, t in target_metrics.items():
+            t_centroid = t.get('centroid', (0.0,0.0,0.0))
+            t_nodes = t.get('nodes_coords', [])
+            overlap = len(set(map(tuple, b_nodes)).intersection(set(map(tuple, t_nodes))))
+            overlap_ratio = overlap / max(1, len(b_nodes))
+            dist = math.dist(b_centroid, t_centroid)
+            centroid_ok = dist <= tol
+            score = overlap_ratio + (0.5 if centroid_ok else 0.0)
+            if score > best_score:
+                best_score = score; best = (t_pid, overlap_ratio, centroid_ok)
+        if best:
+            t_pid, overlap_ratio, centroid_ok = best
+            if overlap_ratio >= overlap_threshold or centroid_ok:
+                matches.append((b_pid, t_pid))
+                baseline_only.discard(b_pid); target_only.discard(t_pid)
+    return matches, baseline_only, target_only
+
+# -------------------------
+# Element-level thickness extraction & comparison
+# -------------------------
+def build_element_thickness_map_for_part(part_metrics):
+    parsed = part_metrics.get('parsed_full', {})
+    elements = part_metrics.get('elements', {})
+    elem_thickness_map = {}
+    prop_map = {}
+
+    parsed_props = parsed.get('properties') or parsed.get('pid_props') or {}
+    parsed_sections = parsed.get('sections') or {}
+    for pid, pdata in (parsed_props.items() if isinstance(parsed_props, dict) else []):
+        try:
+            t = pdata.get('thickness')
+            if t is not None:
+                prop_map[pid] = Decimal(str(t))
+        except:
+            continue
+    for secid, sdata in parsed_sections.items():
+        if isinstance(secid, int) and 'thickness' in sdata:
+            try:
+                prop_map[secid] = Decimal(str(sdata['thickness']))
+            except:
+                continue
+    pid_props = parsed.get('pid_props') or {}
+    for pid, pdata in pid_props.items():
+        if 'thickness' in pdata:
+            try:
+                prop_map[pid] = Decimal(str(pdata['thickness']))
+            except:
+                continue
+
+    elem_to_pid = parsed.get('elem_to_pid') or {}
+    for eid, elem in elements.items():
+        pid = elem.get('pid')
+        thickness = None
+        if pid in prop_map:
+            thickness = prop_map[pid]
+            elem_thickness_map[eid] = thickness
+            continue
+        part_thick = part_metrics.get('thickness')
+        if part_thick is not None:
+            try:
+                elem_thickness_map[eid] = Decimal(str(part_thick))
+                continue
+            except:
+                pass
+        prop_raw = part_metrics.get('prop_raw') or ''
+        mat_raw = part_metrics.get('mat_raw') or ''
+        nums = numeric_tokens_from_text(normalize_block(prop_raw) + '\n' + normalize_block(mat_raw))
+        candidate = None
+        for n in nums:
+            try:
+                v = float(n)
+                if 1e-9 < abs(v) < 1000:
+                    candidate = Decimal(str(v))
+                    break
+            except:
+                continue
+        if candidate is not None:
+            elem_thickness_map[eid] = candidate
+            continue
+        elem_thickness_map[eid] = None
+
+    method = 'prop_map' if prop_map else 'inferred_or_part'
+    return elem_thickness_map, method, prop_map
+
+def compare_element_thicknesses(b_part, t_part, rel_tol, abs_tol):
+    b_map, b_method, b_prop_map = build_element_thickness_map_for_part(b_part)
+    t_map, t_method, t_prop_map = build_element_thickness_map_for_part(t_part)
+
+    b_eids = set(b_map.keys())
+    t_eids = set(t_map.keys())
+    common_eids = b_eids.intersection(t_eids)
+    per_element_diffs = []
+    b_vals = [v for v in b_map.values() if v is not None]
+    t_vals = [v for v in t_map.values() if v is not None]
+
+    def stats_from_vals(vals):
+        if not vals:
+            return {'count': 0, 'min': None, 'max': None, 'mean': None, 'median': None}
+        nums = [float(v) for v in vals]
+        return {'count': len(nums), 'min': min(nums), 'max': max(nums), 'mean': statistics.mean(nums), 'median': statistics.median(nums)}
+
+    b_stats = stats_from_vals(b_vals)
+    t_stats = stats_from_vals(t_vals)
+
+    equal = True
+    if common_eids:
+        for eid in sorted(common_eids):
+            b_t = b_map.get(eid)
+            t_t = t_map.get(eid)
+            if b_t is None and t_t is None:
+                continue
+            if b_t is None or t_t is None:
+                per_element_diffs.append((eid, b_t, t_t, None, None))
+                equal = False
+                continue
+            diff = t_t - b_t
+            rel = (abs(diff) / b_t) if (b_t != 0) else Decimal('1')
+            per_element_diffs.append((eid, b_t, t_t, diff, rel))
+            if abs(diff) > abs_tol and rel > rel_tol:
+                equal = False
+    else:
+        if b_stats['count'] and t_stats['count']:
+            mean_diff = abs(Decimal(str(t_stats['mean'])) - Decimal(str(b_stats['mean'])))
+            rel_mean = (mean_diff / Decimal(str(b_stats['mean']))) if b_stats['mean'] else Decimal('1')
+            if mean_diff > abs_tol and rel_mean > rel_tol:
+                equal = False
+        else:
+            if (b_stats['count'] and not t_stats['count']) or (t_stats['count'] and not b_stats['count']):
+                equal = False
+
+    unmatched = {'baseline_only': sorted(list(b_eids - t_eids)), 'target_only': sorted(list(t_eids - b_eids))}
+    method_info = {'baseline_method': b_method, 'target_method': t_method, 'baseline_prop_map': b_prop_map, 'target_prop_map': t_prop_map}
+    return {'equal': equal, 'b_stats': b_stats, 't_stats': t_stats, 'per_element_diffs': per_element_diffs, 'unmatched': unmatched, 'method_info': method_info}
+
+# -------------------------
+# Block & node comparison helpers
+# -------------------------
+def compare_blocks(b_raw, t_raw):
+    b_text = normalize_block(b_raw) if b_raw else ''
+    t_text = normalize_block(t_raw) if t_raw else ''
+    equal = (b_text.strip() == t_text.strip())
+    diff_lines = []
+    if not equal:
+        b_lines = b_text.splitlines(); t_lines = t_text.splitlines()
+        diff_lines = list(difflib.unified_diff(b_lines, t_lines, lineterm=''))
+    b_nums = numeric_tokens_from_text(b_text)
+    t_nums = numeric_tokens_from_text(t_text)
+    numeric_diffs = []
+    minlen = min(len(b_nums), len(t_nums))
+    for i in range(minlen):
+        try:
+            bval = Decimal(str(float(b_nums[i]))); tval = Decimal(str(float(t_nums[i])))
+            if bval != tval:
+                numeric_diffs.append((i, bval, tval))
+        except:
+            continue
+    if len(b_nums) != len(t_nums):
+        numeric_diffs.append(('len_mismatch', len(b_nums), len(t_nums)))
+    return {'equal': equal, 'diff_lines': diff_lines, 'numeric_diffs': numeric_diffs, 'b_text': b_text, 't_text': t_text}
+
+def compare_nodes(b_coords, t_coords, node_tol):
+    b_set = set(map(tuple, b_coords)); t_set = set(map(tuple, t_coords))
+    common = b_set.intersection(t_set)
+    unmatched_b = list(b_set - common); unmatched_t = list(t_set - common)
+    per_node_delta = []
+    for b in unmatched_b:
+        best = None; best_d = None
+        for t in unmatched_t:
+            d = math.dist(b, t)
+            if best_d is None or d < best_d:
+                best_d = d; best = t
+        if best is not None:
+            per_node_delta.append({'baseline': b, 'target': best, 'delta': best_d})
+    equal = True
+    if unmatched_b or unmatched_t:
+        equal = False
+    else:
+        for pd in per_node_delta:
+            if pd['delta'] > node_tol:
+                equal = False; break
+    return {'equal': equal, 'common_count': len(common), 'unmatched_baseline': unmatched_b, 'unmatched_target': unmatched_t, 'per_node_delta': per_node_delta}
+
+# -------------------------
+# Writers
+# -------------------------
+def write_k_file(output_path, pids, metrics):
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('*KEYWORD\n*TITLE\n')
+        f.write(f"Segregated parts created {datetime.datetime.now().isoformat()}\n")
+        for pid in pids:
+            if pid not in metrics: continue
+            p = metrics[pid]
+            pname = p.get('name') or f"PART_{pid}"
+            mid = p.get('mid') or 0
+            f.write('*PART\n'); f.write(f"{pname}\n"); f.write(f"{pid:10d}{mid:10d}\n")
+            if p.get('prop_raw'):
+                f.write('$ PROPERTY RAW\n')
+                if isinstance(p['prop_raw'], list):
+                    for ln in p['prop_raw']: f.write(f"$ {ln}\n")
+                else:
+                    f.write(f"$ {p['prop_raw']}\n")
+            if p.get('mat_raw'):
+                f.write('$ MATERIAL RAW\n')
+                if isinstance(p['mat_raw'], list):
+                    for ln in p['mat_raw']: f.write(f"$ {ln}\n")
+                else:
+                    f.write(f"$ {p['mat_raw']}\n")
+            if p.get('thickness') is not None:
+                f.write(f"$ THICKNESS: {p.get('thickness')}\n")
+        f.write('*NODE\n')
+        coord_to_nid = {}; next_nid = 1
+        for pid in pids:
+            if pid not in metrics: continue
+            for coord in metrics[pid].get('nodes_coords', []):
+                key = (float(coord[0]), float(coord[1]), float(coord[2]))
+                if key not in coord_to_nid:
+                    coord_to_nid[key] = next_nid; next_nid += 1
+        for coord, nid in coord_to_nid.items():
+            x, y, z = coord; f.write(f"{nid:8d}{x:16.8f}{y:16.8f}{z:16.8f}\n")
+        f.write('*END\n')
+
+def write_support_file(output_dir, bname, tname, b_pid, t_pid, baseline_metrics, target_metrics, node_tol, elem_tol_abs, elem_tol_rel):
+    b = baseline_metrics[b_pid]; t = target_metrics[t_pid]
+    fname = f"support_{bname}_pid{b_pid}_vs_{tname}_pid{t_pid}.txt"
+    path = os.path.join(output_dir, fname)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(f"Support details for Baseline PID {b_pid} vs Target PID {t_pid}\n")
+        f.write(f"Baseline file: {b.get('filepath')}\nTarget file: {t.get('filepath')}\n\n")
+        f.write("=== Node comparison ===\n")
+        node_cmp = compare_nodes(b.get('nodes_coords', []), t.get('nodes_coords', []), node_tol)
+        f.write(f"Common nodes: {node_cmp['common_count']}\n")
+        f.write(f"Unmatched baseline nodes: {len(node_cmp['unmatched_baseline'])}\n")
+        for c in node_cmp['unmatched_baseline'][:200]: f.write(f"  B-only: {c}\n")
+        f.write(f"Unmatched target nodes: {len(node_cmp['unmatched_target'])}\n")
+        for c in node_cmp['unmatched_target'][:200]: f.write(f"  T-only: {c}\n")
+        f.write("\nPer-node nearest deltas (sample):\n")
+        for pd in node_cmp['per_node_delta'][:200]:
+            f.write(f"  Baseline {pd['baseline']} -> Target {pd['target']} | delta={pd['delta']:.6g}\n")
+
+        f.write("\n=== Property comparison ===\n")
+        prop_cmp = compare_blocks(b.get('prop_raw'), t.get('prop_raw'))
+        f.write(f"Equal: {prop_cmp['equal']}\n")
+        if prop_cmp['diff_lines']:
+            f.write("Diff (unified):\n"); [f.write(ln + '\n') for ln in prop_cmp['diff_lines']]
+        if prop_cmp['numeric_diffs']:
+            f.write("Numeric diffs:\n"); [f.write(f"  idx {nd[0]} baseline={nd[1]} target={nd[2]}\n") for nd in prop_cmp['numeric_diffs']]
+        f.write("\nBaseline property raw:\n"); f.write((normalize_block(b.get('prop_raw')) or "(none)") + '\n')
+        f.write("\nTarget property raw:\n"); f.write((normalize_block(t.get('prop_raw')) or "(none)") + '\n')
+
+        f.write("\n=== Material comparison ===\n")
+        mat_cmp = compare_blocks(b.get('mat_raw'), t.get('mat_raw'))
+        f.write(f"Equal: {mat_cmp['equal']}\n")
+        if mat_cmp['diff_lines']:
+            f.write("Diff (unified):\n"); [f.write(ln + '\n') for ln in mat_cmp['diff_lines']]
+        if mat_cmp['numeric_diffs']:
+            f.write("Numeric diffs:\n"); [f.write(f"  idx {nd[0]} baseline={nd[1]} target={nd[2]}\n") for nd in mat_cmp['numeric_diffs']]
+        f.write("\nBaseline material raw:\n"); f.write((normalize_block(b.get('mat_raw')) or "(none)") + '\n')
+        f.write("\nTarget material raw:\n"); f.write((normalize_block(t.get('mat_raw')) or "(none)") + '\n')
+
+        f.write("\n=== Element-level thickness comparison ===\n")
+        elem_cmp = compare_element_thicknesses(b, t, elem_tol_rel, elem_tol_abs)
+        f.write(f"Equal (element-level): {elem_cmp['equal']}\n")
+        f.write(f"Baseline element thickness stats: {elem_cmp['b_stats']}\n")
+        f.write(f"Target element thickness stats: {elem_cmp['t_stats']}\n")
+        f.write("Per-element diffs (common eids) sample:\n")
+        for ped in elem_cmp['per_element_diffs'][:500]:
+            eid, b_t, t_t, diff, rel = ped
+            f.write(f"  EID {eid}: baseline={b_t} target={t_t} diff={diff} rel={rel}\n")
+        f.write("\nUnmatched element ids baseline-only (sample):\n")
+        for e in elem_cmp['unmatched']['baseline_only'][:200]: f.write(f"  {e}\n")
+        f.write("\nUnmatched element ids target-only (sample):\n")
+        for e in elem_cmp['unmatched']['target_only'][:200]: f.write(f"  {e}\n")
+    return path
+
+# -------------------------
+# Main compare & segregate
+# -------------------------
+def compare_and_segregate(baseline_metrics, target_metrics, baseline_file, target_file, output_dir, thickness_tol, volume_tol, node_tol, elem_rel_tol, elem_abs_tol):
+    centroid_tol = Decimal('1.0')
+    matches, baseline_only, target_only = match_parts_by_geometry(baseline_metrics, target_metrics, centroid_tol)
+
+    prop_changes = []; mat_changes = []; node_changes = []; vol_changes = []; elem_thick_changes = []
+    changed_pairs = set()
+
+    for b_pid, t_pid in matches:
+        b = baseline_metrics[b_pid]; t = target_metrics[t_pid]
+        b_vol = b.get('volume', Decimal('0.0')); t_vol = t.get('volume', Decimal('0.0'))
+        if b_vol > Decimal('1e-12') and t_vol > Decimal('1e-12'):
+            vol_diff = abs(t_vol - b_vol); vol_pct = vol_diff / b_vol
+            if vol_pct > volume_tol:
+                vol_changes.append((b_pid, t_pid, float(vol_pct*100))); changed_pairs.add((b_pid, t_pid))
+        prop_cmp = compare_blocks(b.get('prop_raw'), t.get('prop_raw'))
+        if (not prop_cmp['equal']) or prop_cmp['numeric_diffs']:
+            prop_changes.append((b_pid, t_pid, prop_cmp)); changed_pairs.add((b_pid, t_pid))
+        mat_cmp = compare_blocks(b.get('mat_raw'), t.get('mat_raw'))
+        if (not mat_cmp['equal']) or mat_cmp['numeric_diffs']:
+            mat_changes.append((b_pid, t_pid, mat_cmp)); changed_pairs.add((b_pid, t_pid))
+        node_cmp = compare_nodes(b.get('nodes_coords', []), t.get('nodes_coords', []), node_tol)
+        if not node_cmp['equal']:
+            node_changes.append((b_pid, t_pid, node_cmp)); changed_pairs.add((b_pid, t_pid))
+        elem_cmp = compare_element_thicknesses(b, t, elem_rel_tol, elem_abs_tol)
+        if not elem_cmp['equal']:
+            elem_thick_changes.append((b_pid, t_pid, elem_cmp)); changed_pairs.add((b_pid, t_pid))
+
+    os.makedirs(output_dir, exist_ok=True)
+    bbase = os.path.splitext(os.path.basename(baseline_file))[0]
+    tbase = os.path.splitext(os.path.basename(target_file))[0]
+
+    changed_b_pids = sorted({bp for bp, tp in changed_pairs})
+    changed_t_pids = sorted({tp for bp, tp in changed_pairs})
+
+    changed_baseline_file = None; changed_target_file = None
+    if changed_b_pids:
+        changed_baseline_file = os.path.join(output_dir, f"{bbase}_changed_parts.k")
+        write_k_file(changed_baseline_file, changed_b_pids, baseline_metrics)
+    if changed_t_pids:
+        changed_target_file = os.path.join(output_dir, f"{tbase}_changed_parts.k")
+        write_k_file(changed_target_file, changed_t_pids, target_metrics)
+
+    baseline_only_file = None; target_only_file = None
+    if baseline_only:
+        baseline_only_file = os.path.join(output_dir, f"{bbase}_only_parts.k")
+        write_k_file(baseline_only_file, sorted(list(baseline_only)), baseline_metrics)
+    if target_only:
+        target_only_file = os.path.join(output_dir, f"{tbase}_only_parts.k")
+        write_k_file(target_only_file, sorted(list(target_only)), target_metrics)
+
+    support_files = []
+    for (bp, tp) in sorted(changed_pairs):
+        sf = write_support_file(output_dir, bbase, tbase, bp, tp, baseline_metrics, target_metrics, node_tol, elem_abs_tol, elem_rel_tol)
+        support_files.append(sf)
+
+    report_path = os.path.join(output_dir, f"comparison_{bbase}_vs_{tbase}.txt")
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write("#################################################################\n")
+        f.write("## ELEMENT-LEVEL THICKNESS COMPARISON REPORT\n")
+        f.write("#################################################################\n")
+        f.write(f"Baseline: {baseline_file}\nTarget:   {target_file}\nGenerated: {datetime.datetime.now().isoformat()}\n")
+        f.write("-----------------------------------------------------------------\n\n")
+        f.write("Matched pairs (baseline_pid -> target_pid):\n")
+        for m in matches: f.write(f"  {m[0]} -> {m[1]}\n")
+        f.write("\n--- Volume changes ---\n")
+        if vol_changes:
+            for it in vol_changes: f.write(f"  Baseline {it[0]} vs Target {it[1]} | ΔVol% = {it[2]:.6f}\n")
+        else: f.write("  None\n")
+        f.write("\n--- Property card changes ---\n")
+        if prop_changes:
+            for it in prop_changes: f.write(f"  Baseline {it[0]} vs Target {it[1]} | prop_diff_lines={len(it[2]['diff_lines'])} numeric_diffs={len(it[2]['numeric_diffs'])}\n")
+        else: f.write("  None\n")
+        f.write("\n--- Material card changes ---\n")
+        if mat_changes:
+            for it in mat_changes: f.write(f"  Baseline {it[0]} vs Target {it[1]}\n")
+        else: f.write("  None\n")
+        f.write("\n--- Node coordinate changes ---\n")
+        if node_changes:
+            for it in node_changes: f.write(f"  Baseline {it[0]} vs Target {it[1]} | common={it[2]['common_count']} unmatched_b={len(it[2]['unmatched_baseline'])} unmatched_t={len(it[2]['unmatched_target'])}\n")
+        else: f.write("  None\n")
+        f.write("\n--- Element-level thickness changes ---\n")
+        if elem_thick_changes:
+            for it in elem_thick_changes:
+                bpid, tpid, cmp = it
+                f.write(f"  Baseline {bpid} vs Target {tpid} | baseline_stats={cmp['b_stats']} target_stats={cmp['t_stats']} per_element_diffs={len(cmp['per_element_diffs'])} unmatched_b={len(cmp['unmatched']['baseline_only'])} unmatched_t={len(cmp['unmatched']['target_only'])}\n")
+        else:
+            f.write("  None\n")
+        f.write("\n--- Segregated files ---\n")
+        f.write(f"changed_baseline_file: {changed_baseline_file}\n")
+        f.write(f"changed_target_file: {changed_target_file}\n")
+        f.write(f"baseline_only_file: {baseline_only_file}\n")
+        f.write(f"target_only_file: {target_only_file}\n")
+        f.write("\n--- Supporting detail files ---\n")
+        for sf in support_files: f.write(f"  {sf}\n")
+        f.write(f"\nReport saved to: {report_path}\n")
+
+    return {
+        'report': report_path,
+        'changed_baseline_file': changed_baseline_file,
+        'changed_target_file': changed_target_file,
+        'baseline_only_file': baseline_only_file,
+        'target_only_file': target_only_file,
+        'support_files': support_files
+    }
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    cfg = load_config()
+    INPUT_DIR = cfg['INPUT_DIR']; OUTPUT_DIR = cfg['OUTPUT_DIR']
+    ALL_PATTERNS = cfg['ALL_PATTERNS']; FEA_PATTERNS = cfg['FEA_PATTERNS']; GEOM_PATTERNS = cfg['GEOM_PATTERNS']
+    THICKNESS_TOL = cfg['THICKNESS_TOL']; VOLUME_TOL = cfg['VOLUME_TOL']; NODE_TOL = cfg['NODE_TOL']
+    ELEM_REL_TOL = cfg['ELEM_THICK_REL_TOL']; ELEM_ABS_TOL = cfg['ELEM_THICK_ABS_TOL']
+    BASELINE_FILE_NAME = cfg['BASELINE_FILE_NAME']; TARGET_FILE_PATTERNS = cfg['TARGET_FILE_PATTERNS']
+
+    if not TARGET_FILE_PATTERNS:
+        print("Error: TARGET_FILE_NAME not set in config.json"); sys.exit(1)
+
+    os.makedirs(INPUT_DIR, exist_ok=True); os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    all_files = _get_files(ALL_PATTERNS, INPUT_DIR)
+    if len(all_files) < 2:
+        print(f"Error: found only {len(all_files)} files in {INPUT_DIR}. Need baseline + targets."); sys.exit(1)
+
+    print(f"Parsing {len(all_files)} files using up to {cpu_count()} cores...")
+
+    args = [(f, FEA_PATTERNS, GEOM_PATTERNS) for f in all_files]
+    with Pool(cpu_count()) as pool:
+        results = list(pool.map(parse_file_worker, args))
+
+    metrics_map = {}
+    for res in results:
+        if res:
+            metrics, filepath = res
+            metrics_map[os.path.join(INPUT_DIR, os.path.basename(filepath))] = metrics
+
+    baseline_path = os.path.join(INPUT_DIR, BASELINE_FILE_NAME)
+    expanded_targets = []
+    for pat in TARGET_FILE_PATTERNS:
+        expanded_targets.extend(glob.glob(os.path.join(INPUT_DIR, pat)))
+    if not expanded_targets:
+        print("Error: no target files matched patterns in config.json"); sys.exit(1)
+
+    for target_path in expanded_targets:
+        if baseline_path not in metrics_map:
+            print(f"Baseline metrics not found for {baseline_path}. Aborting."); break
+        if target_path not in metrics_map:
+            print(f"Target metrics not found for {target_path}. Skipping."); continue
+        baseline_metrics = metrics_map[baseline_path]; target_metrics = metrics_map[target_path]
+        print(f"\nComparing baseline {os.path.basename(baseline_path)} vs target {os.path.basename(target_path)} ...")
+        out = compare_and_segregate(baseline_metrics, target_metrics, baseline_path, target_path, OUTPUT_DIR, THICKNESS_TOL, VOLUME_TOL, NODE_TOL, ELEM_REL_TOL, ELEM_ABS_TOL)
+        print(f"Report: {out['report']}")
+        if out['changed_baseline_file']: print(f"Changed baseline parts: {out['changed_baseline_file']}")
+        if out['changed_target_file']: print(f"Changed target parts: {out['changed_target_file']}")
+        if out['support_files']: print(f"Support files created: {len(out['support_files'])}")
+
+if __name__ == "__main__":
+    main()
