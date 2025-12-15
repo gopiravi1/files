@@ -1,0 +1,96 @@
+import os
+import json
+import sys
+ 
+CONFIG_FILE = 'config.json'
+ 
+def load_config(config_path):
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            
+            chunk_mb = config.get('chunk_size_mb', 90)
+            
+            if not isinstance(chunk_mb, int) or chunk_mb <= 0:
+                 raise ValueError("The 'chunk_size_mb' must be a positive integer.")
+                 
+            config['CHUNK_SIZE'] = chunk_mb * 1024 * 1024
+            
+            if 'input_filepath' not in config or 'output_directory' not in config:
+                raise KeyError("Both 'input_filepath' and 'output_directory' must be defined in config.json.")
+            
+            return config
+            
+    except FileNotFoundError:
+        print(f"Error: Configuration file '{config_path}' not found.")
+        print("Please ensure 'config.json' is in the same directory.")
+        sys.exit(1)
+    except json.JSONDecodeError:
+        print(f"Error: Invalid JSON format in '{config_path}'. Please check the syntax.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"An error occurred during config loading: {e}")
+        sys.exit(1)
+ 
+ 
+def split_file(config):
+    input_filepath = config['input_filepath']
+    output_dir = config['output_directory']
+    CHUNK_SIZE = config['CHUNK_SIZE']
+    CHUNK_SIZE_MB = config['chunk_size_mb']
+    
+    if not os.path.exists(input_filepath):
+        print(f"Error: Input file not found at '{input_filepath}'")
+        sys.exit(1)
+ 
+    os.makedirs(output_dir, exist_ok=True)
+    
+    filename = os.path.basename(input_filepath)
+    file_size = os.path.getsize(input_filepath)
+    
+    print(f"\nStarting split of file: {filename}")
+    print(f"Total size: {file_size / (1024 * 1024):.2f} MB")
+    print(f"Chunk size: {CHUNK_SIZE_MB} MB")
+ 
+    part_num = 1
+    total_written = 0
+ 
+    try:
+        with open(input_filepath, 'rb') as input_file:
+            while True:
+                chunk = input_file.read(CHUNK_SIZE)
+                
+                if not chunk:
+                    break
+                
+                output_filename = f"{filename}.part_{part_num:03d}"
+                output_filepath = os.path.join(output_dir, output_filename)
+                
+                with open(output_filepath, 'wb') as output_file:
+                    output_file.write(chunk)
+                
+                total_written += len(chunk)
+                print(f"   -> Created {output_filename} (Size: {len(chunk) / (1024 * 1024):.2f} MB)")
+                part_num += 1
+ 
+    except Exception as e:
+        print(f"An error occurred during file processing: {e}")
+        sys.exit(1)
+ 
+    print(f"\nSplitting complete!")
+    print(f"Total parts created: {part_num - 1}")
+    print(f"Total data processed: {total_written / (1024 * 1024):.2f} MB")
+ 
+def main():
+    config = load_config(CONFIG_FILE)
+    split_file(config)
+ 
+if __name__ == "__main__":
+    main()
+ 
+{
+    "input_filepath": "/path/to/your/large_dyna_model.k",
+    "output_directory": "/path/to/save/the/split_parts",
+    "chunk_size_mb": 90
+}
+ 
